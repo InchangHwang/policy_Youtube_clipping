@@ -1,0 +1,14 @@
+# 민감 정보
+config.py
+crudential.txt
+crudential_youtube.txt
+
+# 실행 중 생성 파일
+processed_videos.json
+clipping.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
