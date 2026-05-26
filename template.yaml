@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  대외정책 뉴스클리핑 — YouTube 국무회의 모니터링 서버리스 배치
+  EventBridge(15분) → Lambda → Gemini 요약 → Telegram 전송
+
+# ──────────────────────────────────────────────
+# 파라미터
+# ──────────────────────────────────────────────
+Parameters:
+  SecretName:
+    Type: String
+    Default: policy-clipping/credentials
+    Description: >
+      AWS Secrets Manager 시크릿 이름.
+      아래 키를 JSON으로 저장하세요:
+        YOUTUBE_API_KEY, GEMINI_API_KEY,
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+  ChannelIds:
+    Type: String
+    Default: UCIMOytYIzaUpoAM2bpT4JZQ
+    Description: 모니터링할 YouTube 채널 ID (복수 시 쉼표 구분)
+
+  MaxResultsPerChannel:
+    Type: Number
+    Default: 10
+    Description: 채널당 최신 영상 수집 개수
+
+  GeminiModel:
+    Type: String
+    Default: gemini-2.5-flash
+    Description: 사용할 Gemini 모델명
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(15 minutes)
+    Description: EventBridge 실행 주기 (rate 또는 cron 표현식)
+
+# ──────────────────────────────────────────────
+# 전역 설정
+# ──────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 600        # 10분 — Gemini 자막 분석 시간 고려
+    MemorySize: 512     # MB
+    Environment:
+      Variables:
+        SECRET_NAME: !Ref SecretName
+        CACHE_BUCKET: !Ref CacheBucket
+        CHANNEL_IDS: !Ref ChannelIds
+        MAX_RESULTS_PER_CHANNEL: !Ref MaxResultsPerChannel
+        GEMINI_MODEL: !Ref GeminiModel
+
+# ──────────────────────────────────────────────
+# 리소스
+# ──────────────────────────────────────────────
+Resources:
+
+  # ── Lambda Function ──────────────────────────
+  PolicyClippingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: policy-youtube-clipping
+      CodeUri: .
+      Handler: lambda_function.lambda_handler
+      Description: YouTube 국무회의 영상 모니터링 및 텔레그램 알림 (15분 주기)
+
+      # EventBridge 스케줄 트리거
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Name: policy-clipping-schedule
+            Description: 15분마다 YouTube 채널 수집
+            Enabled: true
+
+      # IAM 권한 — 최소 권한 원칙
+      Policies:
+        # Secrets Manager 읽기 전용
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub >-
+                  arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}*
+
+        # S3 캐시 버킷 읽기/쓰기
+        - S3CrudPolicy:
+            BucketName: !Ref CacheBucket
+
+        # CloudWatch Logs (Lambda 기본 제공이지만 명시)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub >-
+                arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/policy-youtube-clipping:*
+
+  # ── CloudWatch Log Group ─────────────────────
+  PolicyClippingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/policy-youtube-clipping
+      RetentionInDays: 30   # 로그 30일 보존
+
+  # ── S3 캐시 버킷 ─────────────────────────────
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub policy-clipping-cache-${AWS::AccountId}
+      # 퍼블릭 액세스 완전 차단
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # 버전 관리 — 캐시 파일 실수 삭제 복구 대비
+      VersioningConfiguration:
+        Status: Enabled
+      # 오래된 버전 자동 삭제 (30일)
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  # ── S3 버킷 정책 — Lambda 역할만 접근 허용 ───
+  CacheBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CacheBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaOnly
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt PolicyClippingFunctionRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub ${CacheBucket.Arn}/*
+
+# ──────────────────────────────────────────────
+# 출력값
+# ──────────────────────────────────────────────
+Outputs:
+  LambdaFunctionArn:
+    Description: Lambda 함수 ARN
+    Value: !GetAtt PolicyClippingFunction.Arn
+
+  LambdaFunctionName:
+    Description: Lambda 함수 이름
+    Value: !Ref PolicyClippingFunction
+
+  CacheBucketName:
+    Description: S3 캐시 버킷 이름
+    Value: !Ref CacheBucket
+
+  CloudWatchLogGroup:
+    Description: CloudWatch 로그 그룹
+    Value: !Ref PolicyClippingLogGroup
+
+  SecretName:
+    Description: Secrets Manager 시크릿 이름 (API Key 저장 위치)
+    Value: !Ref SecretName
