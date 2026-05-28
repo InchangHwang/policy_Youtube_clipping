@@ -19,10 +19,12 @@ clipping.log
 *.log
 
 # ─────────────────────────────────────────────
-# AWS SAM 빌드 산출물
+# Lambda 빌드 산출물
 # ─────────────────────────────────────────────
+build/
+lambda_package.zip
 .aws-sam/
-samconfig.toml          # sam deploy 시 생성 (계정 정보 포함 가능)
+samconfig.toml
 
 # ─────────────────────────────────────────────
 # Python
