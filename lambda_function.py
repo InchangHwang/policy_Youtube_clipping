@@ -120,10 +120,6 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
     videos = []
     for item in response.get("items", []):
         title = item["snippet"]["title"]
-        normalized = title.replace(" ", "")
-        if "국무회의" not in normalized:
-            logger.info(f"[필터 제외] {title}")
-            continue
         video_id = item["id"]["videoId"]
         videos.append({
             "id": video_id,

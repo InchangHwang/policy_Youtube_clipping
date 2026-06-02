@@ -64,13 +64,9 @@ def fetch_latest_videos(channel_id: str) -> list[dict]:
         title = item["snippet"]["title"]
         published_at = item["snippet"]["publishedAt"]
         url = f"https://www.youtube.com/watch?v={video_id}"
-        normalized = title.replace(" ", "")
-        if "국무회의" in normalized:
-            videos.append(
+        videos.append(
                 {"id": video_id, "title": title, "url": url, "published_at": published_at}
             )
-        else:
-            log.info(f"[필터 제외] {title}")
     return videos
 
 
