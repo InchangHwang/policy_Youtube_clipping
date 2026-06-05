@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import google.generativeai as genai
@@ -97,13 +98,17 @@ def save_cache(cache: set):
 # ──────────────────────────────────────────────
 
 def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
-    """채널 최신 영상 중 '국무회의' 포함 영상만 반환."""
-    max_results = int(os.environ.get("MAX_RESULTS_PER_CHANNEL", "10"))
+    """최근 30분 이내 업로드된 영상만 조회."""
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(minutes=30)
+    published_after = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    logger.info(f"[영상 조회] 채널: {channel_id} / since: {published_after}")
 
     youtube = build(
         "youtube", "v3",
         developerKey=api_key,
-        cache_discovery=False,  # Lambda 환경 file_cache 경고 방지
+        cache_discovery=False,
     )
     response = (
         youtube.search()
@@ -112,21 +117,24 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
             part="snippet",
             order="date",
             type="video",
-            maxResults=max_results,
+            publishedAfter=published_after,
+            maxResults=10,
         )
         .execute()
     )
 
     videos = []
     for item in response.get("items", []):
-        title = item["snippet"]["title"]
         video_id = item["id"]["videoId"]
+        title = item["snippet"]["title"]
         videos.append({
             "id": video_id,
             "title": title,
             "url": f"https://www.youtube.com/watch?v={video_id}",
             "published_at": item["snippet"]["publishedAt"],
         })
+
+    logger.info(f"[영상 조회 완료] {len(videos)}건")
     return videos
 
 
