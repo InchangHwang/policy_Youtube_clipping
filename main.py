@@ -4,6 +4,8 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+KST = timezone(timedelta(hours=9))  # 한국 표준시 (UTC+9)
+
 import google.generativeai as genai
 import requests
 import schedule
@@ -47,9 +49,10 @@ def fetch_latest_videos(channel_id: str) -> list[dict]:
     """최근 30분 이내 업로드된 영상만 조회."""
     now = datetime.now(timezone.utc)
     since = now - timedelta(minutes=30)
-    published_after = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    published_after = since.strftime("%Y-%m-%dT%H:%M:%SZ")  # YouTube API는 UTC 필수
 
-    log.info(f"[영상 조회] 채널: {channel_id} / since: {published_after}")
+    since_kst = since.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    log.info(f"[영상 조회] 채널: {channel_id} / since: {since_kst}")
 
     youtube = build("youtube", "v3", developerKey=config.YOUTUBE_API_KEY)
     response = (
@@ -161,10 +164,12 @@ def send_telegram(message: str, retries: int = 5, retry_delay: int = 10):
 
 
 def build_message(video: dict, summary: str) -> str:
-    published = video["published_at"][:10]
+    # YouTube API가 반환하는 published_at은 UTC → KST로 변환
+    published_utc = datetime.strptime(video["published_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    published_kst = published_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
     return (
         f"📌 <b>[대외정책 뉴스클리핑]</b>\n"
-        f"📅 {published}\n\n"
+        f"📅 {published_kst}\n\n"
         f"🎬 <b>{video['title']}</b>\n"
         f"🔗 {video['url']}\n\n"
         f"📝 <b>요약</b>\n{summary}"
