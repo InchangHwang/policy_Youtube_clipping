@@ -112,6 +112,7 @@ def summarize_video(title: str, url: str) -> str:
     try:
         prompt = (
             f"다음 유튜브 영상을 한국어로 요약해줘.\n"
+            f"출력 형식을 HTML로 해줘.\n"
             f"영상 제목: {title}\n"
             f"영상 URL: {url}\n\n"
             + summary_prompt
@@ -127,6 +128,7 @@ def summarize_video(title: str, url: str) -> str:
     transcript = get_transcript(video_id)
     prompt = (
         f"다음은 유튜브 영상의 자막 텍스트야. 한국어로 요약해줘.\n"
+        f"출력 형식을 HTML로 해줘.\n"
         f"영상 제목: {title}\n\n"
         f"[자막]\n{transcript}\n\n"
         + summary_prompt
@@ -168,7 +170,7 @@ def build_message(video: dict, summary: str) -> str:
     published_utc = datetime.strptime(video["published_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     published_kst = published_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
     return (
-        f"📌 <b>[대외정책 뉴스클리핑]</b>\n"
+        f"📌 <b>[KTV 유튜브]</b>\n"
         f"📅 {published_kst}\n\n"
         f"🎬 <b>{video['title']}</b>\n"
         f"🔗 {video['url']}\n\n"
