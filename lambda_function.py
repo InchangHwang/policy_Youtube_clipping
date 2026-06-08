@@ -126,10 +126,18 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
         .execute()
     )
 
+    KEYWORDS = ["국무회의", "국무 회의"]
+
     videos = []
     for item in response.get("items", []):
         video_id = item["id"]["videoId"]
         title = item["snippet"]["title"]
+
+        # 키워드 필터링: '국무회의' 또는 '국무 회의' 포함 영상만 수집
+        if not any(kw in title for kw in KEYWORDS):
+            logger.info(f"[필터 제외] {title}")
+            continue
+
         videos.append({
             "id": video_id,
             "title": title,
@@ -137,7 +145,7 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
             "published_at": item["snippet"]["publishedAt"],
         })
 
-    logger.info(f"[영상 조회 완료] {len(videos)}건")
+    logger.info(f"[영상 조회 완료] {len(videos)}건 (키워드 필터 통과)")
     return videos
 
 
