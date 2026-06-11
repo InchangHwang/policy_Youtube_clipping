@@ -68,7 +68,7 @@ def fetch_latest_videos(channel_id: str) -> list[dict]:
         .execute()
     )
 
-    KEYWORDS = ["국무회의", "국무 회의"]
+    KEYWORDS = ["국무회의", "국무 회의", "수석보좌관회의"]
 
     videos = []
     for item in response.get("items", []):
