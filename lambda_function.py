@@ -1,13 +1,16 @@
 """
-대외정책 뉴스클리핑 - YouTube 국무회의 모니터링
+대외정책 뉴스클리핑 - YouTube KTV 정책뉴스 모니터링
 AWS Lambda 핸들러
 
 [ 실행 흐름 ]
 EventBridge (15분) → lambda_handler
     → Secrets Manager에서 API Key 조회
-    → YouTube API로 채널 최신 영상 수집
-    → 국무회의 키워드 필터링
+    → YouTube API로 채널 최신 영상 수집 (일반 + 완료된 라이브)
+    → 키워드 필터링 (국무회의 / 수석보좌관회의)
+    → 라이브 영상: actualEndTime 확인 → 진행 중이면 제외
     → Gemini API로 영상 요약 (직접 분석 → 자막 분석 순)
+      → 요약 실패 시: 제목+링크만 전송, S3에 실패 기록
+      → 30분 후 재시도: 성공 시 전송, 실패 시 캐시 유지
     → 텔레그램 전송
     → S3 캐시 저장 (중복 방지)
 """
@@ -62,37 +65,52 @@ def get_secrets() -> dict:
 
 
 # ──────────────────────────────────────────────
-# S3 캐시 (처리된 영상 ID 저장 — Lambda 무상태 보완)
+# S3 캐시 (Lambda 무상태 보완)
 # ──────────────────────────────────────────────
 
-def load_cache() -> set:
-    """S3에서 처리된 영상 ID 캐시 로드."""
+def _s3_get_json(key: str, default):
     s3 = boto3.client("s3")
     bucket = os.environ["CACHE_BUCKET"]
     try:
-        resp = s3.get_object(Bucket=bucket, Key="processed_videos.json")
-        return set(json.loads(resp["Body"].read().decode("utf-8")))
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(resp["Body"].read().decode("utf-8"))
     except s3.exceptions.NoSuchKey:
-        logger.info("캐시 파일 없음 — 신규 시작")
-        return set()
+        return default
     except Exception as e:
-        logger.warning(f"캐시 로드 실패 (빈 캐시로 진행): {e}")
-        return set()
+        logger.warning(f"S3 읽기 실패 ({key}): {e}")
+        return default
 
 
-def save_cache(cache: set):
-    """처리된 영상 ID 캐시를 S3에 저장."""
+def _s3_put_json(key: str, data):
     s3 = boto3.client("s3")
     bucket = os.environ["CACHE_BUCKET"]
     try:
         s3.put_object(
             Bucket=bucket,
-            Key="processed_videos.json",
-            Body=json.dumps(list(cache), ensure_ascii=False),
+            Key=key,
+            Body=json.dumps(data, ensure_ascii=False),
             ContentType="application/json",
         )
     except Exception as e:
-        logger.error(f"캐시 저장 실패: {e}")
+        logger.error(f"S3 저장 실패 ({key}): {e}")
+
+
+def load_processed_cache() -> set:
+    """처리 완료(전송 성공) 영상 ID 목록."""
+    return set(_s3_get_json("processed_videos.json", []))
+
+
+def save_processed_cache(cache: set):
+    _s3_put_json("processed_videos.json", list(cache))
+
+
+def load_failed_cache() -> dict:
+    """요약 실패 영상 캐시 {video_id: attempt_count}."""
+    return _s3_get_json("failed_videos.json", {})
+
+
+def save_failed_cache(cache: dict):
+    _s3_put_json("failed_videos.json", cache)
 
 
 # ──────────────────────────────────────────────
@@ -100,11 +118,14 @@ def save_cache(cache: set):
 # ──────────────────────────────────────────────
 
 def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
-    """최근 30분 이내 업로드된 영상만 조회."""
+    """
+    최근 30분 이내 업로드된 일반 영상 + 종료된 라이브 영상 조회.
+    - 일반 영상: publishedAt 기준 30분
+    - 라이브 영상: actualEndTime 기준 30분 (진행 중이면 제외)
+    """
     now = datetime.now(timezone.utc)
     since = now - timedelta(minutes=30)
-    published_after = since.strftime("%Y-%m-%dT%H:%M:%SZ")  # YouTube API는 UTC 필수
-
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     since_kst = since.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     logger.info(f"[영상 조회] 채널: {channel_id} / since: {since_kst}")
 
@@ -113,36 +134,78 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
         developerKey=api_key,
         cache_discovery=False,
     )
-    response = (
-        youtube.search()
-        .list(
-            channelId=channel_id,
-            part="snippet",
-            order="date",
-            type="video",
-            publishedAfter=published_after,
-            maxResults=10,
-        )
-        .execute()
-    )
+
+    # 1. 최근 30분 내 업로드된 영상
+    regular_resp = youtube.search().list(
+        channelId=channel_id,
+        part="snippet",
+        order="date",
+        type="video",
+        publishedAfter=since_str,
+        maxResults=10,
+    ).execute()
+
+    # 2. 최근 완료된 라이브 스트림 (종료 시점 기준 수집)
+    live_resp = youtube.search().list(
+        channelId=channel_id,
+        part="snippet",
+        order="date",
+        type="video",
+        eventType="completed",
+        maxResults=5,
+    ).execute()
+
+    # 중복 제거 병합
+    all_items: dict = {}
+    for item in regular_resp.get("items", []) + live_resp.get("items", []):
+        vid_id = item["id"]["videoId"]
+        if vid_id not in all_items:
+            all_items[vid_id] = item
+
+    if not all_items:
+        logger.info("[영상 조회 완료] 0건")
+        return []
+
+    # liveStreamingDetails 조회 (라이브 종료 여부 확인)
+    details_resp = youtube.videos().list(
+        id=",".join(all_items.keys()),
+        part="liveStreamingDetails,snippet",
+    ).execute()
 
     KEYWORDS = ["국무회의", "국무 회의", "수석보좌관회의"]
-
     videos = []
-    for item in response.get("items", []):
-        video_id = item["id"]["videoId"]
-        title = item["snippet"]["title"]
 
-        # 키워드 필터링: '국무회의' 또는 '국무 회의' 포함 영상만 수집
+    for detail in details_resp.get("items", []):
+        video_id = detail["id"]
+        title = detail["snippet"]["title"]
+        published_at = detail["snippet"]["publishedAt"]
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        live_details = detail.get("liveStreamingDetails")
+
+        # 키워드 필터링
         if not any(kw in title for kw in KEYWORDS):
             logger.info(f"[필터 제외] {title}")
             continue
 
+        # 라이브 영상 처리
+        if live_details:
+            actual_end = live_details.get("actualEndTime")
+            if not actual_end:
+                logger.info(f"[라이브 진행중 제외] {title}")
+                continue
+            end_dt = datetime.strptime(actual_end, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if end_dt < since:
+                logger.info(f"[라이브 종료 30분 초과 제외] {title}")
+                continue
+            published_at = actual_end  # 종료 시간을 기준 시간으로 사용
+            end_kst = end_dt.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
+            logger.info(f"[라이브 종료 확인] {title} / 종료: {end_kst}")
+
         videos.append({
             "id": video_id,
             "title": title,
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-            "published_at": item["snippet"]["publishedAt"],
+            "url": url,
+            "published_at": published_at,
         })
 
     logger.info(f"[영상 조회 완료] {len(videos)}건 (키워드 필터 통과)")
@@ -166,6 +229,7 @@ def summarize_video(title: str, url: str, gemini_api_key: str) -> str:
     Gemini API로 영상 내용을 한국어로 요약.
     1차: 영상 URL 직접 분석
     2차: 자막 텍스트 기반 분석 (영상이 너무 길 경우)
+    실패 시 예외를 그대로 raise — 호출부에서 처리.
     """
     genai.configure(api_key=gemini_api_key)
     model = genai.GenerativeModel(
@@ -214,15 +278,27 @@ def summarize_video(title: str, url: str, gemini_api_key: str) -> str:
 # ──────────────────────────────────────────────
 
 def build_message(video: dict, summary: str) -> str:
-    # YouTube API가 반환하는 published_at은 UTC → KST로 변환
     published_utc = datetime.strptime(video["published_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     published_kst = published_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
     return (
-        f"📌 <b>[대외정책 뉴스클리핑]</b>\n"
+        f"📌 <b>[KTV 정책뉴스]</b>\n"
         f"📅 {published_kst}\n\n"
         f"🎬 <b>{video['title']}</b>\n"
         f"🔗 {video['url']}\n\n"
         f"📝 <b>요약</b>\n{summary}"
+    )
+
+
+def build_title_only_message(video: dict) -> str:
+    """요약 실패 시 영상 제목과 링크만 전송."""
+    published_utc = datetime.strptime(video["published_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    published_kst = published_utc.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
+    return (
+        f"📌 <b>[KTV 정책뉴스]</b>\n"
+        f"📅 {published_kst}\n\n"
+        f"🎬 <b>{video['title']}</b>\n"
+        f"🔗 {video['url']}\n\n"
+        f"⚠️ <i>요약을 가져오지 못했습니다. 영상을 직접 확인해주세요.</i>"
     )
 
 
@@ -270,21 +346,20 @@ def lambda_handler(event, context):
     """
     logger.info("===== Lambda 배치 시작 =====")
 
-    # Secrets Manager에서 API Key 조회
     secrets = get_secrets()
     youtube_api_key    = secrets["YOUTUBE_API_KEY"]
     gemini_api_key     = secrets["GEMINI_API_KEY"]
     telegram_bot_token = secrets["TELEGRAM_BOT_TOKEN"]
     telegram_chat_id   = secrets["TELEGRAM_CHAT_ID"]
 
-    # 환경 변수에서 채널 ID 목록 조회
     channel_ids = [
         cid.strip()
         for cid in os.environ.get("CHANNEL_IDS", "").split(",")
         if cid.strip()
     ]
 
-    cache = load_cache()
+    processed_cache = load_processed_cache()
+    failed_cache = load_failed_cache()
     new_count = 0
 
     for channel_id in channel_ids:
@@ -296,23 +371,41 @@ def lambda_handler(event, context):
             continue
 
         for video in videos:
-            if video["id"] in cache:
+            video_id = video["id"]
+
+            if video_id in processed_cache:
                 continue
 
-            logger.info(f"새 영상 발견: {video['title']}")
+            attempt = failed_cache.get(video_id, 0)
+            if attempt >= 2:
+                continue  # 2회 실패 → 영구 스킵
+
+            label = "[재시도]" if attempt else "새 영상 발견"
+            logger.info(f"{label}: {video['title']}")
+
             try:
-                summary = summarize_video(
-                    video["title"], video["url"], gemini_api_key
-                )
+                summary = summarize_video(video["title"], video["url"], gemini_api_key)
                 message = build_message(video, summary)
                 send_telegram(message, telegram_bot_token, telegram_chat_id)
-                cache.add(video["id"])
+                processed_cache.add(video_id)
+                if video_id in failed_cache:
+                    del failed_cache[video_id]
                 new_count += 1
-                time.sleep(2)
             except Exception as e:
-                logger.error(f"처리 실패 ({video['title']}): {e}")
+                if attempt == 0:
+                    # 1회차 실패: 제목+링크만 전송, 실패 기록
+                    logger.warning(f"요약 실패 (1차) — 제목+링크만 전송: {e}")
+                    send_telegram(build_title_only_message(video), telegram_bot_token, telegram_chat_id)
+                    failed_cache[video_id] = 1
+                else:
+                    # 2회차 실패: 캐시 유지, 추가 전송 없음
+                    logger.warning(f"요약 실패 (2차) — 재시도 종료: {e}")
+                    failed_cache[video_id] = 2
 
-    save_cache(cache)
+            time.sleep(2)
+
+    save_processed_cache(processed_cache)
+    save_failed_cache(failed_cache)
     logger.info(f"===== Lambda 배치 완료 (신규 {new_count}건) =====")
 
     return {
