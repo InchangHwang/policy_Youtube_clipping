@@ -173,6 +173,7 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
     ).execute()
 
     KEYWORDS = ["국무회의", "국무 회의", "수석보좌관회의"]
+    logger.info(f"[키워드 필터] 조회 키워드: {KEYWORDS}")
     videos = []
 
     for detail in details_resp.get("items", []):
@@ -183,9 +184,11 @@ def fetch_latest_videos(channel_id: str, api_key: str) -> list[dict]:
         live_details = detail.get("liveStreamingDetails")
 
         # 키워드 필터링
-        if not any(kw in title for kw in KEYWORDS):
+        matched = [kw for kw in KEYWORDS if kw in title]
+        if not matched:
             logger.info(f"[필터 제외] {title}")
             continue
+        logger.info(f"[키워드 일치] '{matched}' → {title}")
 
         # 라이브 영상 처리
         if live_details:
