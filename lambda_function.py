@@ -235,6 +235,21 @@ def parse_iso_duration(duration: str) -> int:
     s = int(match.group(3) or 0)
     return h * 3600 + m * 60 + s
 
+def get_video_duration(video_id: str, api_key: str) -> int | None:
+    """영상 길이(초) 조회. 조회 실패 시 None 반환 (호출부에서 그냥 발송)."""
+    try:
+        youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
+        resp = youtube.videos().list(id=video_id, part="contentDetails").execute()
+        items = resp.get("items", [])
+        if not items:
+            logger.warning(f"[길이 조회 실패] 영상 정보 없음: {video_id}")
+            return None
+        duration_iso = items[0]["contentDetails"].get("duration", "PT0S")
+        return parse_iso_duration(duration_iso)
+    except Exception as e:
+        logger.warning(f"[길이 조회 실패] {video_id}: {e}")
+        return None
+
 def summarize_video(title: str, url: str, gemini_api_key: str, youtube_api_key: str) -> str:
     """
     1) videos.list로 description 가져와서 요약
@@ -413,6 +428,12 @@ def lambda_handler(event, context):
                 pending_cache[video_id] = {"title": video["title"], "url": video["url"]}
                 logger.info(f"[라이브 진행중 알림] {video['title']}")
             else:
+                # 쇼츠 제외: 영상 길이 3분(180초) 이하면 수집하지 않음.
+                # 단, 길이 조회 실패(None) 시에는 그대로 발송 진행.
+                duration = get_video_duration(video_id, youtube_api_key)
+                if duration is not None and duration <= 180:
+                    logger.info(f"[쇼츠 제외] {video['title']} ({duration}초)")
+                    continue
                 attempt = failed_cache.get(video_id, 0)
                 if attempt >= 2:
                     continue
