@@ -260,10 +260,14 @@ def summarize_video(title: str, url: str, gemini_api_key: str, youtube_api_key: 
     model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
     video_id = url.split("v=")[-1]
     summary_format = (
+        "아래 형식으로, 텔레그램 HTML 형식에 맞춰 요약해줘.\n"
+        "- 굵게는 <b>텍스트</b>, 기울임은 <i>텍스트</i> 태그만 사용\n"
+        "- <ul>, <li>, <h1>~<h6>, <p>, <br>, <div> 및 마크다운(**, ##, - 등)은 절대 쓰지 말 것\n"
+        "- 줄바꿈은 실제 개행 문자로, 항목 구분은 문장 앞에 • 기호로\n\n"
         "요약 형식:\n"
-        "• 핵심 주제 1~2문장\n"
-        "• 주요 내용 bullet 3~5개\n"
-        "• 대외정책 관련 시사점 (있을 경우)\n"
+        "• <b>핵심 주제</b>: 1~2문장\n"
+        "• <b>주요 내용</b>: bullet 3~5개\n"
+        "• <b>대외정책 시사점</b>: (있을 경우)\n"
     )
     # videos.list로 description + duration 조회
     youtube = build("youtube", "v3", developerKey=youtube_api_key, cache_discovery=False)
